@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wb_full_parser.py
+Парсер Wildberries (категория -> все товары в категории).
+Собирает: Название, Цена, Скидка, Рейтинг, Отзывы, Наличие, Продавец, Категория, Бренд, Артикул, Ссылка, Изображение
+Сохраняет в result.xlsx
+
+Антидетект-меры:
+- Ротация User-Agent и Referer
+- Использование прокси (поддержка списка прокси с ротацией)
+- Случайные паузы между запросами
+- Обработка ошибки 498 (смена прокси при обнаружении)
+
+Пример запуска:
+python wb_full_parser.py --url "https://www.wildberries.ru/catalog/elektronika/telefony" --category "Электроника/Телефоны" --limit 500
+python wb_full_parser.py --url "https://www.wildberries.ru/catalog/elektronika/telefony" --category "Электроника/Телефоны" --proxies-file proxies.json
+"""
+import argparse
+import time
+import random
+import requests
+from urllib.parse import urlparse, urljoin, urlencode
+from bs4 import BeautifulSoup
+import pandas as pd
+import sys
+import json
+
+# ----------------- Настройки -----------------
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/118.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0",
+]
+
+REFERERS = [
+    "https://www.google.com/",
+    "https://yandex.ru/",
+    "https://market.yandex.ru/",
+    "https://www.bing.com/",
+]
+
+HEADERS = {
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "TE": "Trailers",
+}
+
+# Прокси для обхода блокировок. Пример формата: [{'http': 'http://user:pass@ip:port', 'https': 'https://user:pass@ip:port'}, ...]
+PROXIES_LIST = []
+PROXIES = None
+SLEEP_MIN = 1.5
+SLEEP_MAX = 4.0
+MAX_RETRIES = 5
+
+
+# ----------------- Утилиты -----------------
+def rand_sleep():
+    time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+
+def load_proxies_from_file(filepath):
+    """Загружает список прокси из JSON файла"""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            proxies_data = json.load(f)
+            if isinstance(proxies_data, list):
+                return proxies_data
+    except Exception as e:
+        print(f"[ERR] Ошибка загрузки прокси из файла {filepath}: {e}")
+    return []
+
+def get_random_proxy():
+    """Возвращает случайный прокси из списка или None если список пуст"""
+    if PROXIES_LIST:
+        return random.choice(PROXIES_LIST)
+    return None
+
+def get_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    
+    # Установка случайного прокси для сессии
+    proxy = get_random_proxy()
+    if proxy:
+        s.proxies.update(proxy)
+        
+    return s
+
+def safe_get(session, url, max_retries=MAX_RETRIES, timeout=18):
+    for attempt in range(1, max_retries+1):
+        try:
+            # Рандомизация User-Agent и Referer для каждого запроса
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Referer": random.choice(REFERERS)
+            }
+            session.headers.update(headers)
+            
+            r = session.get(url, timeout=timeout, proxies=session.proxies)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 498, 503):  # Добавляем 498 к списку кодов для повтора
+                # При ошибке 498 меняем прокси если доступны
+                if r.status_code == 498 and PROXIES_LIST:
+                    print(f"[INFO] Обнаружена ошибка 498, меняю прокси...")
+                    new_proxy = get_random_proxy()
+                    if new_proxy:
+                        session.proxies.update(new_proxy)
+                        print(f"[INFO] Установлен новый прокси")
+                
+                wait = (2 ** attempt) + random.random() * 3
+                print(f"[WARN] Rate limited {r.status_code} on {url}. Waiting {wait:.1f}s")
+                time.sleep(wait)
+            else:
+                print(f"[WARN] HTTP {r.status_code} for {url}")
+                return r
+        except requests.RequestException as e:
+            wait = (2 ** attempt) + random.random() * 2
+            print(f"[ERR] Network error: {e}. Retry in {wait}s (attempt {attempt}/{max_retries})")
+            time.sleep(wait)
+    return None
+
+
+# ----------------- robots.txt check -----------------
+def fetch_robots_txt(base_domain):
+    robots_url = urljoin(base_domain, "/robots.txt")
+    try:
+        r = requests.get(robots_url, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=10)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return ""
+
+
+def wb_is_allowed(category_url):
+    """Простая проверка: проверяем, что robots.txt содержит Allow: /*?page= и не запрещает корневой путь."""
+    parsed = urlparse(category_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    robots = fetch_robots_txt(base)
+    if not robots:
+        print("[INFO] Не удалось получить robots.txt. Рекомендуется проверить вручную.")
+        return False
+    # Упрощённый парсинг: ищем Allow: /*?page= для User-agent: *
+    # Если есть "Disallow: /*?*" — это общая строка, но Allow /*?page= делает листание страниц разрешённым.
+    allow_page = "Allow: /*?page=" in robots or "Allow: /*?page=" in robots.replace(" ", "")
+    if allow_page:
+        print("[OK] robots.txt явно разрешает ссылки с ?page= -> можно листать страницы категории.")
+        return True
+    # Если не найдено — предупредить
+    print("[WARN] robots.txt не явно разрешает ?page=. Проверь robots.txt вручную.")
+    return False
+
+
+# ----------------- Парсинг карточки товара -----------------
+def parse_product_page(session, product_url):
+    """Заходим в карточку, возвращаем словарь с Rating, ReviewsCount, Availability (текст)."""
+    data = {"Рейтинг": "", "Отзывы": "", "Наличие": ""}
+    r = safe_get(session, product_url)
+    if not r:
+        return data
+    soup = BeautifulSoup(r.text, "lxml")
+    # Рейтинг: часто есть элемент с классом 'rate' или 'rating' или meta itemprop
+    rating = ""
+    # try structured meta
+    m = soup.select_one("meta[itemprop='ratingValue']") or soup.select_one("meta[property='og:rating']")
+    if m and m.get("content"):
+        rating = m["content"]
+    else:
+        # визуальные селекторы
+        r_el = soup.select_one(".product-reviews__rating_value") or soup.select_one(".rating__value") or soup.select_one(".rate")
+        if r_el:
+            rating = r_el.get_text(strip=True)
+    if rating:
+        data["Рейтинг"] = rating
+
+    # Кол-во отзывов
+    reviews = ""
+    rev_el = soup.select_one("[data-review-count]") or soup.select_one(".prod-review-count") or soup.find(string=lambda x: x and "отзыв" in x.lower())
+    if rev_el:
+        try:
+            reviews = rev_el.get_text(strip=True)
+        except Exception:
+            reviews = str(rev_el).strip()
+    data["Отзывы"] = reviews
+
+    # Наличие: ищем текст с "в наличии", "под заказ", "нет в наличии"
+    avail = ""
+    # Wildberries иногда показывает блок с 'В наличии' / 'Под заказ' / 'Нет в наличии' - ищем варианты
+    avail_candidates = soup.select(".product-availability, .j-availability, .availability, .product__ordering")
+    for a in avail_candidates:
+        t = a.get_text(strip=True)
+        if t:
+            avail = t
+            break
+    # fallback: найти слова в странице
+    if not avail:
+        page_text = soup.get_text(separator=" ").lower()
+        if "нет в наличии" in page_text:
+            avail = "Нет в наличии"
+        elif "в наличии" in page_text:
+            avail = "В наличии"
+    data["Наличие"] = avail
+    return data
+
+
+# ----------------- Парсинг страницы категории -----------------
+def parse_category(category_url, category_label=None, limit=None):
+    session = get_session()
+    items = []
+    page = 1
+    consecutive_empty = 0
+    while True:
+        # Собираем URL с параметром ?page=
+        sep = "&" if "?" in category_url else "?"
+        page_url = f"{category_url}{sep}page={page}"
+        print(f"[PAGE] {page_url}")
+        r = safe_get(session, page_url)
+        if not r:
+            print("[ERR] Не удалось получить страницу категории, прерываем.")
+            break
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Попытки найти карточки: несколько вариантов селекторов
+        # На WB карточки часто в li с data-nm-id, либо div with product-card
+        cards = soup.select("[data-nm-id]") or soup.select("div.product-card") or soup.select("article")
+        if not cards:
+            # запасной вариант: ссылки на /product/ или /card/
+            cards = soup.select("a[href*='/product/']") or soup.select("a[href*='/card/']")
+        print(f"[INFO] Найдено карточек на странице: {len(cards)}")
+        if not cards:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                break
+            page += 1
+            rand_sleep()
+            continue
+
+        consecutive_empty = 0
+        for c in cards:
+            try:
+                # Ссылка
+                a = c.find("a", href=True)
+                href = ""
+                if a:
+                    href = a["href"]
+                    if href.startswith("/"):
+                        href = urljoin("https://www.wildberries.ru", href)
+                # Название (несколько кандидатов)
+                name_el = c.select_one(".goods-name") or c.select_one(".brand-name") or c.select_one(".product-card__brand, .product-card__name") or c.find("span")
+                name = name_el.get_text(strip=True) if name_el else ""
+
+                # Цена / скидка
+                price = ""
+                price_el = c.select_one(".price-commission__current-price") or c.select_one(".price") or c.select_one(".lower-price") or c.select_one(".product-price")
+                if price_el:
+                    price = price_el.get_text(strip=True)
+
+                # discount - try old price
+                disc = ""
+                disc_el = c.select_one(".price-commission__old-price") or c.select_one(".price-discount") or c.select_one(".product-price-old")
+                if disc_el:
+                    disc = disc_el.get_text(strip=True)
+
+                # Brand / Seller
+                brand = ""
+                brand_el = c.select_one(".brand") or c.select_one(".goods-brand")
+                if brand_el:
+                    brand = brand_el.get_text(strip=True)
+
+                # SKU / Артикул (обычно data-nm-id)
+                sku = ""
+                if c.has_attr("data-nm-id"):
+                    sku = c["data-nm-id"]
+                else:
+                    # возможно в data-sku или в href
+                    if c.get("data-sku"):
+                        sku = c.get("data-sku")
+                    elif "nm=" in href:
+                        # parse nm=...
+                        import re
+                        m = re.search(r"nm=(\d+)", href)
+                        if m:
+                            sku = m.group(1)
+
+                # Изображение
+                img = ""
+                img_el = c.select_one("img")
+                if img_el:
+                    img = img_el.get("data-src") or img_el.get("src") or img_el.get("data-original") or ""
+                    if img.startswith("//"):
+                        img = "https:" + img
+
+                item = {
+                    "Название": name,
+                    "Цена": price,
+                    "Скидка": disc,
+                    "Рейтинг": "",
+                    "Отзывы": "",
+                    "Наличие": "",
+                    "Продавец": brand,
+                    "Категория": category_label or "",
+                    "Бренд": brand,
+                    "Артикул": sku,
+                    "Ссылка": href,
+                    "Изображение": img
+                }
+
+                # Если ссылка есть — зайти в карточку для рейтинга/отзывов/наличия
+                if href:
+                    # Увеличенная пауза перед заходом в карточку для снижения активности
+                    time.sleep(random.uniform(1.0, 3.0))
+                    detail = parse_product_page(session, href)
+                    item["Рейтинг"] = detail.get("Рейтинг", "")
+                    item["Отзывы"] = detail.get("Отзывы", "")
+                    item["Наличие"] = detail.get("Наличие", "")
+
+                items.append(item)
+                print(f"[ITEM] {item['Название'][:60]} | {item['Цена']} | SKU:{item['Артикул']}")
+                # лимит
+                if limit and len(items) >= limit:
+                    print("[INFO] Достигнут лимит товаров.")
+                    return items
+                    
+                # Дополнительная пауза между обработкой карточек для снижения активности
+                time.sleep(random.uniform(0.5, 1.5))
+            except Exception as ex:
+                print(f"[ERR] Ошибка при парсинге карточки: {ex}")
+                # Пауза после ошибки перед следующей попыткой
+                time.sleep(random.uniform(1.0, 2.0))
+                continue
+
+        page += 1
+        rand_sleep()
+    return items
+
+
+# ----------------- Сохранение в Excel -----------------
+def save_to_excel(items, filename="result.xlsx"):
+    if not items:
+        print("[INFO] Нет данных для сохранения.")
+        return
+    df = pd.DataFrame(items)
+    order = ["Название", "Цена", "Скидка", "Рейтинг", "Отзывы", "Наличие",
+             "Продавец", "Категория", "Бренд", "Артикул", "Ссылка", "Изображение"]
+    cols = [c for c in order if c in df.columns] + [c for c in df.columns if c not in order]
+    df = df[cols]
+    df.to_excel(filename, index=False)
+    print(f"[DONE] Сохранено {len(df)} строк в {filename}")
+
+
+# ----------------- CLI -----------------
+def main():
+    parser = argparse.ArgumentParser(description="Wildberries full category parser")
+    parser.add_argument("--url", help="URL категории Wildberries (без параметров или с ними)")
+    parser.add_argument("--category", default="", help="Метка категории для столбца Категория")
+    parser.add_argument("--limit", type=int, default=0, help="Максимум товаров (0 = весь каталог)")
+    parser.add_argument("--proxies-file", help="Путь к JSON файлу со списком прокси")
+    args = parser.parse_args()
+
+    # Если не указан URL, выходим (для поддержки --help)
+    if not args.url:
+        parser.print_help()
+        return
+
+    # Загрузка прокси если указан файл
+    if args.proxies_file:
+        global PROXIES_LIST
+        PROXIES_LIST = load_proxies_from_file(args.proxies_file)
+        print(f"[INFO] Загружено {len(PROXIES_LIST)} прокси из файла {args.proxies_file}")
+
+    # Проверим robots.txt
+    allowed = wb_is_allowed(args.url)
+    if not allowed:
+        print("[STOP] Парсер обнаружил, что robots.txt не однозначно разрешает парсинг с ?page=. Продолжение на ваш риск. Введите 'y' чтобы продолжить.")
+        try:
+            c = input().strip().lower()
+            if c != "y":
+                print("Выход.")
+                sys.exit(1)
+        except KeyboardInterrupt:
+            print("\nВыход по запросу пользователя.")
+            sys.exit(0)
+
+    limit = args.limit if args.limit > 0 else None
+    items = parse_category(args.url, category_label=args.category, limit=limit)
+    save_to_excel(items, filename="result.xlsx")
+
+
+if __name__ == "__main__":
+    main()
