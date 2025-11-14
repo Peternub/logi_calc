@@ -213,10 +213,11 @@ class SecurityManager {
     const auditResults = await this.runSecurityAudit();
     const configValidation = this.validateSecurityConfig();
 
+    // Safely check for Node.js process APIs (not available in Edge Runtime)
     const systemHealth = {
-      uptime: process.uptime(),
-      memoryUsage: process.memoryUsage(),
-      nodeVersion: process.version,
+      uptime: typeof process !== 'undefined' && process.uptime ? process.uptime() : 0,
+      memoryUsage: typeof process !== 'undefined' && process.memoryUsage ? process.memoryUsage() : {},
+      nodeVersion: typeof process !== 'undefined' && process.version ? process.version : 'unknown',
     };
 
     const recommendations = [
