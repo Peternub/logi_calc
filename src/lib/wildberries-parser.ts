@@ -36,9 +36,11 @@ export class WildberriesParserService {
   private proxiesFilePath: string // Путь к файлу с прокси
 
   constructor() {
-    this.pythonScriptPath = path.join(process.cwd(), 'market_parser.py', 'wb_full_parser.py.txt')
-    this.resultsDirectory = path.join(process.cwd(), 'tmp')
-    this.proxiesFilePath = path.join(process.cwd(), 'market_parser.py', 'proxies.json') // Путь к файлу прокси по умолчанию
+    // Безопасное определение путей с учетом среды выполнения
+    const basePath = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/tmp';
+    this.pythonScriptPath = path.join(basePath, 'market_parser.py', 'wb_full_parser.py.txt')
+    this.resultsDirectory = path.join(basePath, 'tmp')
+    this.proxiesFilePath = path.join(basePath, 'market_parser.py', 'proxies.json') // Путь к файлу прокси по умолчанию
   }
 
   // Проверка наличия Python скрипта
@@ -98,8 +100,10 @@ export class WildberriesParserService {
       console.log(`Запуск парсинга Wildberries: ${command}`)
 
       // Запускаем Python скрипт с автоматическим подтверждением
+      // Безопасное определение рабочей директории
+      const cwd = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/tmp';
       const { stdout, stderr } = await execPromise(`echo y | ${command}`, {
-        cwd: process.cwd(),
+        cwd,
         timeout: 300000 // 5 минут таймаут
       })
 
@@ -119,7 +123,8 @@ export class WildberriesParserService {
       }
       
       // Возвращаем путь к файлу с результатами
-      const resultFile = path.join(process.cwd(), 'result.xlsx')
+      const basePath = typeof process !== 'undefined' && process.cwd ? process.cwd() : '/tmp';
+      const resultFile = path.join(basePath, 'result.xlsx')
       return {
         success: true,
         message: 'Парсинг завершен успешно',
